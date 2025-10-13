@@ -1,0 +1,346 @@
+# -----------------------------------------------------------------------------
+# VGG16 global pruning 
+# -----------------------------------------------------------------------------
+# This script:
+#   • Loads the pretrained VGG16 model (keras.applications).
+#   • Builds a unified per-layer Importance Score (IS) structure (3 FC + 13 Conv).
+#   • Backpropagates IS from output → FC → flatten → Conv stacks using |weights|.
+#   • Selects globally smallest IS entries and marks them as pruned (mask=0).
+#   • Physically removes channels/neurons using Kerassurgeon and saves the model.
+
+# -----------------------------------------------------------------------------
+
+from tensorflow.keras.applications.vgg16 import VGG16  # VGG16 backbone (ImageNet)
+from operator import itemgetter, attrgetter            # sorting helpers for (layer, idx, IS)
+import numpy as np                                     # arrays & vectorization
+from kerassurgeon import Surgeon                       # deletes filters/neurons from Keras models
+from tensorflow.keras.optimizers import Adam           # optimizer for the pruned model
+import warnings                                        # silence warnings for cleaner logs
+import matplotlib.pyplot as plt                        # histograms of IS distributions (diagnostic)
+import time                                            # simple timing of pruning steps
+import msvcrt                                          # UNUSED / safe to remove (Windows-specific)
+
+
+
+
+# -----------------------------------------------------------------------------
+# Load the vanilla VGG16 model (includes the FC head by default).
+# This uses ImageNet weights and the "top" classifier (1000-way).
+# -----------------------------------------------------------------------------
+vgg_16 = VGG16()
+# Print a summary to confirm layer indices (important for Kerassurgeon jobs).
+vgg_16.summary()
+
+# -----------------------------------------------------------------------------
+# Quick inspection: list conv layers and their kernel shapes (H, W, Cin, Cout).
+# Helps verify assumptions about how many filters each block contains.
+# -----------------------------------------------------------------------------
+for layer in vgg_16.layers:
+    if 'conv' not in layer.name:
+        continue
+    filters, biases = layer.get_weights()
+    print(layer.name, filters.shape)
+
+def get_filter_weights(model, layer=None):
+    """Return kernel(s) for one specific conv layer (by index) or for all conv layers.
+       If 'layer' is an int (including 0), returns that layer's kernel.
+       Otherwise, returns a list of kernels for every layer whose name contains 'conv'.
+    """
+    if layer or layer == 0:
+        weight_array = model.layers[layer].get_weights()[0]
+    else:
+        weights = [
+            model.layers[layer_ix].get_weights()[0]
+            for layer_ix in range(len(model.layers))
+            if 'conv' in model.layers[layer_ix].name
+        ]
+        weight_array = [np.array(isb) for isb in weights]
+    return weight_array
+
+# FC (classifier) kernels live at layers [22, 21, 20] in VGG16 with top:
+#   22: Dense(1000)  |  21: Dense(4096)  |  20: Dense(4096)
+ListAbsolutedFCL_new = []
+for layer_ix in [22, 21, 20]:
+    weights = vgg_16.layers[layer_ix].get_weights()
+    raw_data_of_a_layer = weights[0]                         # take kernel only; drop bias
+    weights_of_a_layer = np.array(raw_data_of_a_layer, dtype=np.float32)
+    absoluted_weight = np.abs(weights_of_a_layer, dtype=np.float32)
+    ListAbsolutedFCL_new.append(absoluted_weight)            # collect FC kernels (abs) for IS propagation
+
+# Build a unified IS container of length 16 = 3 FC + 13 Conv.
+ArrLayersIS = np.zeros(16, dtype=object)
+for kkk in range(3):
+    # IS vector length = number of outputs (columns) in each FC kernel
+    ArrTemporaryFCL = np.zeros((1, len(ListAbsolutedFCL_new[kkk][1, :])))
+    ArrLayersIS[kkk] = ArrTemporaryFCL[0]                    # one row → keep as 1D view
+
+# Grab all conv kernels from VGG16; each is (H, W, Cin, Cout).
+weight_array = get_filter_weights(vgg_16, layer=None)
+
+# Initialize IS vectors for conv layers by number of output filters (Cout).
+counter1 = 3
+for ipm in reversed(weight_array):
+    ArrTemporaryConv = np.zeros((1, ipm.shape[3]), dtype=object)
+    ArrLayersIS[counter1] = ArrTemporaryConv[0]              # one row → keep as 1D view
+    counter1 = counter1 + 1
+
+
+# Build the Target Class of Interest mask for the 1000-way ImageNet head.
+ArrOutputLayersTcoi = np.zeros(1000, dtype=np.float32)
+TCoI = 1                       # keep only class index 1 (change as needed)
+ArrOutputLayersTcoi[TCoI] = 1  # 1=keep, 0=prune
+
+# Pruning masks for 16 layers: 1=active, 0=pruned.
+ArrLayersPrunedNeuron = np.zeros(16, dtype=object)
+
+# Initialize all masks to ones (no pruning yet).
+for isk in range(len(ArrLayersPrunedNeuron)):
+    ArrLayersPrunedNeuron[isk] = np.ones_like(ArrLayersIS[isk], dtype=np.float32)
+
+# Seed output mask & IS with the TCoI one-hot.
+ArrLayersPrunedNeuron[0] = ArrOutputLayersTcoi.copy()
+ArrLayersIS[0] = ArrOutputLayersTcoi.copy()
+
+def foo(x, y):
+    # Division helper (kept for fidelity; not used below)
+    return 0 if y == 0 else x / y
+
+# Copy of IS array (not additionally used later; safe to remove).
+ArrLayerForwardIS = ArrLayersIS.copy()
+
+# Number of neurons/filters to prune per iteration inside Pruning()
+name_pruned_neuron_number = 1
+
+
+def Pruning(cycle, name_pruned_neuron_number, tcoi, PrunedNeuron):
+    """Run one pruning stage:
+       • For 'cycle' iterations, compute IS across FC/Conv and prune
+         'name_pruned_neuron_number' globally smallest-IS units per iteration.
+       • After the stage, apply Kerassurgeon deletions and save the pruned model.
+    """
+    howmanyneuronwillbepruned = cycle * name_pruned_neuron_number
+    counter_for_printing_pruned = 0
+    Arrprunedneuroncount = 1
+
+    # Enforce a fixed number of prunes in this stage (stable batch size).
+    while Arrprunedneuroncount <= howmanyneuronwillbepruned:
+
+        ilk = time.time()  # start time (diagnostic)
+
+        # ----- FC SECTION: apply prune masks to the left/right (cols/rows) -----
+        ListAbsolutedFCL = ListAbsolutedFCL_new.copy()  # refresh abs(FC kernels) each iter
+
+        # Left masking: zero target columns (downstream pruned neurons)
+        for ihn in range(3):
+            ListAbsolutedFCL[ihn] = ListAbsolutedFCL[ihn] * PrunedNeuron[ihn]
+
+        # Right masking: zero source rows (upstream pruned neurons)
+        for ihnm in range(2):
+            ListAbsolutedFCL[ihnm] = PrunedNeuron[ihnm + 1].reshape((len(PrunedNeuron[1]), 1)) * ListAbsolutedFCL[ihnm]
+
+        # Bridge flatten → first conv: zero flattened entries tied to pruned conv filters.
+        counter_for_pruned = 0
+        for pruned_index in PrunedNeuron[3]:
+            if pruned_index == 0:
+                ListAbsolutedFCL[2][(counter_for_pruned * 49):(counter_for_pruned * 49 + 49)] = 0
+            counter_for_pruned = counter_for_pruned + 1
+
+        # ----- FC IS PROPAGATION: normalize by column sums, multiply by IS, sum -----
+        for o in range(len(ListAbsolutedFCL)):  # [0,1,2]
+            axis0Sum = ListAbsolutedFCL[o].sum(axis=0).copy()  # column sums
+            # Avoid divide-by-zero by setting zero-sum columns to 1
+            for ijk in range(len(axis0Sum)):
+                if axis0Sum[ijk] == 0:
+                    axis0Sum[ijk] = 1
+            # Column-normalize, then distribute IS and sum back to previous layer
+            np.divide(ListAbsolutedFCL[o], axis0Sum, out=ListAbsolutedFCL[o])
+            np.multiply(ListAbsolutedFCL[o], ArrLayersIS[o], out=ListAbsolutedFCL[o])
+            ArrLayersIS[o + 1] = ListAbsolutedFCL[o].sum(axis=1).copy()
+
+        # ----- FLATTEN → CONV BRIDGE: aggregate IS over the 7x7 tiles per filter -----
+        ListFirstConvLayerFiltersIS = []
+        flatten_layer_size = len(ArrLayersIS[3])
+        plus_forty_nine = 0  # 7x7 = 49 per filter for VGG16
+        for imk in range(int(flatten_layer_size / 49)):
+            ListFirstConvLayerFiltersIS.append(sum(ArrLayersIS[3][plus_forty_nine:(plus_forty_nine + 49)]))
+            plus_forty_nine = plus_forty_nine + 49
+        ArrLayersIS[3] = np.array(ListFirstConvLayerFiltersIS, dtype=np.float32)
+        temp_for_propegation = ArrLayersIS[3].copy()  # carry filter-wise IS forward
+
+        # ----- CONV SECTION: propagate IS through conv stacks -----
+        n = 4  # IS index for the first conv stage after flatten
+        for i in reversed(weight_array):  # traverse conv kernels from deep → shallow
+            i = np.abs(i)
+
+            # Zero-out kernels of filters already pruned in the next (downstream) layer.
+            for f in range(len(PrunedNeuron[n - 1])):
+                if PrunedNeuron[n - 1][f] == 0:
+                    i[:, :, :, f] *= 0
+
+            # Distribute filter-wise IS across kernels
+            if n != 4:
+                i = temp_for_propegation[:, :, None, :] * i
+            else:
+                for ff in range(i.shape[3]):
+                    i[:, :, :, ff] = i[:, :, :, ff] * temp_for_propegation[ff]
+
+            # Compute per-filter IS = sum(|kernel| per filter) / global sum
+            sum_of_all_filters_in_a_layer = np.sum(i)
+            IS_for_filter_wise = []
+            sum_of_filter = 0
+            for s in range(i.shape[3]):          # output filters
+                for k in range(i.shape[2]):      # input channels
+                    for l in range(i.shape[0]):  # height
+                        for m in range(i.shape[1]):  # width
+                            sum_of_filter = sum_of_filter + (i[l][m][k][s])
+                IS_for_filter_wise.append(sum_of_filter / sum_of_all_filters_in_a_layer)
+                sum_of_filter = 0
+
+            ArrLayersIS[n - 1] = IS_for_filter_wise.copy()
+
+            # Prepare IS for the next (shallower) layer propagation step (kept for parity)
+            if n != 16:
+                temp_for_propegation = np.einsum('ijkl->ijk', i)
+            n = n + 1
+
+        # ----- GLOBAL SELECTION LIST -----
+        ListAllForMinVal = []
+        ListForMinValue = []
+
+        # Heuristic scaling by relative surviving size per layer (optional)
+        print("last layer IS", ArrLayersIS[-1])
+        for jackk in np.arange(1, len(ArrLayersIS), 1):
+            ArrLayersIS[jackk] = ArrLayersIS[jackk] / (
+                np.count_nonzero(PrunedNeuron[1] == 1) / np.count_nonzero(PrunedNeuron[jackk] == 1)
+            )
+
+        index1 = 1
+
+        # Optional diagnostics: visualize IS distributions across 15 layers (3x5 grid)
+        fig, axs = plt.subplots(3, 5, figsize=(18, 9), sharex=True)
+        for kkk in range(15):
+            if kkk < 5:
+                axs[0, kkk % 5].hist(ArrLayersIS[kkk + 1], bins=100, align='mid', fill=True, histtype='bar')
+                axs[0, kkk % 5].set_title("%d" % (kkk + 1))
+            if 5 <= kkk < 10:
+                axs[1, kkk % 5].hist(ArrLayersIS[kkk + 1], bins=100, align='mid', fill=True, histtype='bar')
+                axs[1, kkk % 5].set_title("%d" % (kkk + 1))
+            if kkk >= 10:
+                axs[2, kkk % 5].hist(ArrLayersIS[kkk + 1], bins=100, align='mid', fill=True, histtype='bar')
+                axs[2, kkk % 5].set_title("%d" % (kkk + 1))
+        fig.tight_layout()
+        plt.show()
+
+        # Build a single list of candidates (layer_id, index_in_layer, IS_value)
+        for r in ArrLayersIS[index1:]:
+            index2 = 0
+            for rr in r:
+                ListForMinValue.append([index1, index2, rr])
+                index2 = index2 + 1
+            index1 = index1 + 1
+            index2 = 0
+
+        # Sort globally by IS (ascending), then drop zeros (already pruned/inactive)
+        index1 = 1
+        ListSorted = sorted(ListForMinValue, key=itemgetter(2))
+        ListSortedWithoutZeros = []
+        for ink in ListSorted:
+            if ink[2] != 0:
+                ListSortedWithoutZeros.append(ink)
+
+        # Prune the K smallest IS entries (K = name_pruned_neuron_number) for this iteration.
+        for t in ListSortedWithoutZeros[:name_pruned_neuron_number]:
+            print(t, counter_for_printing_pruned, "elapsed % s seconds  " % (time.time() - ilk))
+            PrunedNeuron[t[0]][t[1]] = 0
+
+        counter_for_printing_pruned = counter_for_printing_pruned + name_pruned_neuron_number
+        Arrprunedneuroncount = Arrprunedneuroncount + 1
+
+    # -------------------------------------------------------------------------
+    # After this stage: collect pruned indices, perform surgery, compile & save
+    # -------------------------------------------------------------------------
+    sum_of_pruned_neuron = 0
+    All_Pruned_Index_Value = []
+    for zzz in PrunedNeuron[1:]:
+        IndexNumber = 0
+        TempList = []
+        for z in zzz:
+            if z == 0:
+                TempList.append(IndexNumber)
+            IndexNumber = IndexNumber + 1
+        sum_of_pruned_neuron = sum_of_pruned_neuron + len(TempList)
+        All_Pruned_Index_Value.append(TempList)
+
+    # Map VGG16 layers by index (with top):
+    model = vgg_16
+    layer_1000_output = model.layers[22]
+    fc2_4096 = model.layers[21]
+    fc1_4096 = model.layers[20]
+    block5_conv3 = model.layers[17]
+    block5_conv2 = model.layers[16]
+    block5_conv1 = model.layers[15]
+    block4_conv3 = model.layers[13]
+    block4_conv2 = model.layers[12]
+    block4_conv1 = model.layers[11]
+    block3_conv3 = model.layers[9]
+    block3_conv2 = model.layers[8]
+    block3_conv1 = model.layers[7]
+    block2_conv2 = model.layers[5]
+    block2_conv1 = model.layers[4]
+    block1_conv2 = model.layers[2]
+    block1_conv1 = model.layers[1]
+
+    # Build surgeon jobs:
+    surgeon = Surgeon(model)
+    # Output: delete all classes except 'tcoi'
+    surgeon.add_job('delete_channels', layer_1000_output, channels=[ipk for ipk in range(1000) if ipk != tcoi])
+    # FC: delete pruned neurons
+    surgeon.add_job('delete_channels', fc2_4096, channels=All_Pruned_Index_Value[0])
+    surgeon.add_job('delete_channels', fc1_4096, channels=All_Pruned_Index_Value[1])
+    # CONV: delete pruned filters in order (deep → shallow)
+    surgeon.add_job('delete_channels', block5_conv3, channels=All_Pruned_Index_Value[2])
+    surgeon.add_job('delete_channels', block5_conv2, channels=All_Pruned_Index_Value[3])
+    surgeon.add_job('delete_channels', block5_conv1, channels=All_Pruned_Index_Value[4])
+
+    surgeon.add_job('delete_channels', block4_conv3, channels=All_Pruned_Index_Value[5])
+    surgeon.add_job('delete_channels', block4_conv2, channels=All_Pruned_Index_Value[6])
+    surgeon.add_job('delete_channels', block4_conv1, channels=All_Pruned_Index_Value[7])
+
+    surgeon.add_job('delete_channels', block3_conv3, channels=All_Pruned_Index_Value[8])
+    surgeon.add_job('delete_channels', block3_conv2, channels=All_Pruned_Index_Value[9])
+    surgeon.add_job('delete_channels', block3_conv1, channels=All_Pruned_Index_Value[10])
+
+    surgeon.add_job('delete_channels', block2_conv2, channels=All_Pruned_Index_Value[11])
+    surgeon.add_job('delete_channels', block2_conv1, channels=All_Pruned_Index_Value[12])
+
+    surgeon.add_job('delete_channels', block1_conv2, channels=All_Pruned_Index_Value[13])
+    surgeon.add_job('delete_channels', block1_conv1, channels=All_Pruned_Index_Value[14])
+
+    # Apply surgery and compile the pruned model
+    model_new = surgeon.operate()
+    model_new.summary()
+
+    adam = Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=None, decay=0.0, amsgrad=False)
+    model_new.compile(loss='categorical_crossentropy', optimizer=adam, metrics=['accuracy'])
+
+    # Count total pruned units (for filename)
+    totalpruned = 0
+    for ijkl in PrunedNeuron[1:]:
+        totalpruned = totalpruned + (np.count_nonzero(ijkl == 0))
+
+    # Save with a descriptive name reflecting total pruned count
+    weights_name_pruned = 'Pruned_Model_' + '%d' % (totalpruned)
+    model_new.save(
+        'C:/Users/' + weights_name_pruned + '.h5'
+    )
+    return PrunedNeuron
+
+# -----------------------------------------------------------------------------
+# PRUNING SCHEDULE (grouped/staged pruning):
+# We run multiple stages to empirically see how far we can prune while
+# maintaining accuracy (identify the accuracy-preserving pruning budget).
+#   • First stage is large (7200 iters), then several fine stages (100 iters).
+# Each iteration prunes 'name_pruned_neuron_number' entries globally.
+# -----------------------------------------------------------------------------
+for imn in [7200, 100, 100, 100, 100, 100, 100, 100, 100]:
+    ArrLayersPrunedNeuron = Pruning(imn, name_pruned_neuron_number, TCoI, ArrLayersPrunedNeuron)
